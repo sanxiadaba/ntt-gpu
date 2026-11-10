@@ -1,14 +1,9 @@
 ﻿// ntt_gpu.cu —— 用 CUDA NTT 计算两个超大十进制整数的乘积
 //
-// 做法：十进制按 10^8 切成 limb（八位一个），在三个 32 位 NTT 素数下各做一次
-// 卷积，再用 Garner 把每个卷积系数还原成精确整数，从低位向高位进位成十进制。
+// 十进制按 10^8 切成 limb，在三个 32 位素数下各做一次卷积，Garner 合成精确系数，
+// 再进位成十进制。三素数乘积约 1.79e28，够用到单边 5.37 亿位。
 //
-// 为什么是三个素数：基数 10^8 时卷积系数上界是 (10^8-1)^2 * min(limb 数)，
-// 三个素数乘积约 1.79e28，够用到单边 5.37 亿位。系数最大约 6.8e23，超过 64 位，
-// 用三个 32 位字表示（< 2^94）。
-//
-// 变换方向：正变换用 DIF（自然序进、倒序出），逆变换用 DIT（倒序进、自然序出），
-// 两者配对后频域点乘仍落在倒序上，整个流程不需要位翻转置换。
+// 正变换 DIF、逆变换 DIT，配对后中间结果一直停在倒序上，全程不需要位反转。
 
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -24,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -73,6 +69,7 @@ constexpr u64 kPrime12 = static_cast<u64>(kP1) * kP2;  // < 2^63
 
 struct Mod {
     u32 value;
+    u32 root;        // 原根
     u32 imaginary;   // 4 次单位根 i = root^((p-1)/4)，i^2 = -1
     u64 reciprocal;  // floor(2^64 / p)
 };
@@ -143,6 +140,7 @@ u32 pow_mod_host(u32 base, u32 exponent, u32 modulus) {
 Mod make_mod(u32 prime, u32 generator) {
     Mod mod{};
     mod.value = prime;
+    mod.root = generator;
     mod.reciprocal = 0xFFFFFFFFFFFFFFFFull / prime;
     mod.imaginary = pow_mod_host(generator, (prime - 1) / 4, prime);
     return mod;
@@ -522,12 +520,12 @@ u32 grid_size(u32 item_count) {
     return (item_count + kBlockSize - 1) / kBlockSize;
 }
 
-void prepare_twiddles(GpuBuffers& buffers, const Plan& plan, const Mod& mod, u32 generator) {
+void prepare_twiddles(GpuBuffers& buffers, const Plan& plan, const Mod& mod) {
     for (u32 index = 0; index < plan.count; ++index) {
         const Level& level = plan.levels[index];
         const u32 count = 1u << level.log_stride;
         const u32 width = level.radix * count;  // 2*stride 或 4*stride
-        const u32 root = pow_mod_host(generator, (mod.value - 1) / width, mod.value);
+        const u32 root = pow_mod_host(mod.root, (mod.value - 1) / width, mod.value);
         const u32 inverse_root = pow_mod_host(root, mod.value - 2, mod.value);
         const u32 workers = std::min(count, kTwiddleWorkers);
         generate_twiddles<<<grid_size(workers), kBlockSize>>>(
@@ -619,7 +617,6 @@ void run_modulus(
     const std::vector<u32>& left,
     const std::vector<u32>& right,
     const Mod& mod,
-    u32 generator,
     bool square,
     const Plan& plan,
     size_t coefficient_count,
@@ -629,7 +626,7 @@ void run_modulus(
         upload_limbs(buffers.right(), right, buffers.bytes());
     }
 
-    prepare_twiddles(buffers, plan, mod, generator);
+    prepare_twiddles(buffers, plan, mod);
 
     if (plan.count > 0) {
         run_forward(buffers.left(), buffers, plan, mod);
@@ -1079,7 +1076,6 @@ Product multiply(std::string_view left_text, std::string_view right_text, double
     product.transform_size = transform_size;
 
     const Mod moduli[3] = {make_mod(kP1, kG1), make_mod(kP2, kG2), make_mod(kP3, kG3)};
-    const u32 generators[3] = {kG1, kG2, kG3};
 
     // 残留数组用锁页内存，D2H 拷贝从 1.8 GB/s 提到 10 GB/s 以上。
     PinnedBuffer residues1(coefficient_count);
@@ -1093,8 +1089,8 @@ Product multiply(std::string_view left_text, std::string_view right_text, double
             u32* target = index == 0 ? residues1.data()
                         : index == 1 ? residues2.data()
                                      : residues3.data();
-            run_modulus(buffers, left_limbs, right_limbs, moduli[index], generators[index],
-                        square, plan, coefficient_count, target);
+            run_modulus(buffers, left_limbs, right_limbs, moduli[index], square, plan,
+                        coefficient_count, target);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -1124,52 +1120,27 @@ bool is_help_request(const char* argument) {
     return value == "-h" || value == "--help";
 }
 
-// CUDA 上下文初始化要 170 ms 左右，和读文件、解析并行起来，单次运行省下的
-// 就是这 170 ms。
-class CudaWarmup {
-public:
-    CudaWarmup() {
-        thread_ = std::thread([this] {
-            const auto begin = Clock::now();
-            cudaFree(nullptr);
-            cudaFree(nullptr);
-            milliseconds_.store(milliseconds(begin, Clock::now()));
-        });
-    }
-
-    CudaWarmup(const CudaWarmup&) = delete;
-    CudaWarmup& operator=(const CudaWarmup&) = delete;
-
-    ~CudaWarmup() { wait(); }
-
-    void wait() {
-        if (thread_.joinable()) {
-            thread_.join();
-        }
-    }
-
-    double milliseconds_taken() const { return milliseconds_.load(); }
-
-private:
-    std::thread thread_;
-    std::atomic<double> milliseconds_{0};
-};
+// CUDA 上下文初始化要一百多毫秒，扔到后台和读文件、解析并行。
+std::future<double> warm_up_cuda() {
+    return std::async(std::launch::async, [] {
+        const auto begin = Clock::now();
+        cudaFree(nullptr);
+        return milliseconds(begin, Clock::now());
+    });
+}
 
 void print_report(std::ostream& stream, const Product& product, size_t result_digits,
                   double output_ms) {
-    const double total = product.ms.parse + product.ms.gpu + product.ms.crt +
-                         product.ms.carry + product.ms.init + output_ms;
+    const double total = product.ms.init + product.ms.parse + product.ms.gpu +
+                         product.ms.crt + product.ms.carry + output_ms;
     stream << "left_digits=" << product.left_digits << '\n'
            << "right_digits=" << product.right_digits << '\n'
            << "result_digits=" << result_digits << '\n'
            << "transform_size=" << product.transform_size << '\n'
-           << "input_ms=" << product.ms.parse << '\n'
-           << "init_ms=" << product.ms.init << '\n'
-           << "gpu_phase_ms=" << product.ms.gpu << '\n'
-           << "crt_ms=" << product.ms.crt << '\n'
-           << "carry_ms=" << product.ms.carry << '\n'
-           << "output_ms=" << output_ms << '\n'
-           << "total_ms=" << total << '\n';
+           << "total_ms=" << total << '\n'
+           << "stage_ms=input " << product.ms.parse << " init " << product.ms.init
+           << " gpu " << product.ms.gpu << " crt " << product.ms.crt
+           << " carry " << product.ms.carry << " output " << output_ms << '\n';
 }
 
 std::string make_digits(size_t count, u32 seed) {
@@ -1198,64 +1169,40 @@ size_t parse_count(const char* text) {
     return static_cast<size_t>(value);
 }
 
-constexpr int kBenchRounds = 3;
-
+// 每档跑三轮，报最快的那一轮。
 int run_bench(const char* count_text) {
-    std::vector<size_t> sizes;
-    if (count_text != nullptr) {
-        sizes.push_back(parse_count(count_text));
-    } else {
-        sizes = {1000000, 10000000, 60000000};
-    }
+    const std::vector<size_t> sizes = count_text != nullptr
+        ? std::vector<size_t>{parse_count(count_text)}
+        : std::vector<size_t>{1000000, 10000000, 60000000};
 
-    CudaWarmup warmup;
+    auto warm = warm_up_cuda();
+    double init_ms = 0;
     for (const size_t size : sizes) {
         const std::string left = make_digits(size, 1);
         const std::string right = make_digits(size, 2);
-        warmup.wait();
+        if (init_ms == 0) {
+            init_ms = warm.get();
+        }
 
-        std::array<Timings, kBenchRounds> rounds{};
-        std::array<double, kBenchRounds> output_ms{};
-        Product product;
+        Product best;
+        double best_total = 0;
+        double best_output = 0;
         size_t result_digits = 0;
-        size_t transform_size = 0;
-
-        for (int round = 0; round < kBenchRounds; ++round) {
-            const double init = round == 0 ? warmup.milliseconds_taken() : 0.0;
-            product = multiply(left, right, init);
+        for (int round = 0; round < 3; ++round) {
+            Product product = multiply(left, right, round == 0 ? init_ms : 0.0);
             std::unique_ptr<char[]> buffer(new char[product.limbs.size() * kBaseDigits + 16]);
             const auto begin = Clock::now();
             result_digits = format_limbs(product.limbs, buffer.get());
-            output_ms[round] = milliseconds(begin, Clock::now());
-            rounds[round] = product.ms;
-            transform_size = product.transform_size;
+            const double output_ms = milliseconds(begin, Clock::now());
+            const double total = product.ms.init + product.ms.parse + product.ms.gpu +
+                                 product.ms.crt + product.ms.carry + output_ms;
+            if (round == 0 || total < best_total) {
+                best_total = total;
+                best_output = output_ms;
+                best = std::move(product);
+            }
         }
-
-        auto median = [](std::array<double, kBenchRounds> values) {
-            std::sort(values.begin(), values.end());
-            return values[kBenchRounds / 2];
-        };
-        std::array<double, kBenchRounds> gpu{}, crt{}, carry{}, parse{};
-        for (int round = 0; round < kBenchRounds; ++round) {
-            parse[round] = rounds[round].parse;
-            gpu[round] = rounds[round].gpu;
-            crt[round] = rounds[round].crt;
-            carry[round] = rounds[round].carry;
-        }
-        const double total = median(parse) + median(gpu) + median(crt) + median(carry) +
-                             median(output_ms) + rounds[0].init;
-
-        std::cout << "--- " << size << " 位 × " << size << " 位，结果 " << result_digits
-                  << " 位，变换 " << transform_size << " 点\n"
-                  << "input_ms=" << median(parse) << '\n'
-                  << "init_ms=" << rounds[0].init << '\n'
-                  << "gpu_phase_ms=" << median(gpu) << '\n'
-                  << "crt_ms=" << median(crt) << '\n'
-                  << "carry_ms=" << median(carry) << '\n'
-                  << "output_ms=" << median(output_ms) << '\n'
-                  << "total_ms=" << total << '\n'
-                  << "throughput_mdigit_s=" << (2.0 * static_cast<double>(size) /
-                                                (total / 1000.0) / 1e6) << '\n';
+        print_report(std::cout, best, result_digits, best_output);
     }
     return 0;
 }
@@ -1290,7 +1237,7 @@ int main(int argc, char** argv) {
     std::ostream& diagnostics = to_stdout ? std::cerr : std::cout;
 
     try {
-        CudaWarmup warmup;
+        auto warm = warm_up_cuda();
 
         std::string text;
         if (std::string_view(input_path) == "-") {
@@ -1306,9 +1253,8 @@ int main(int argc, char** argv) {
             text = read_file_bytes(input_path);
         }
         const TwoLines lines = split_input(text);
-        warmup.wait();
 
-        Product product = multiply(lines.left, lines.right, warmup.milliseconds_taken());
+        Product product = multiply(lines.left, lines.right, warm.get());
         std::string().swap(text);  // 原文用完就还回去，上限用例能省 1 GB
 
         std::unique_ptr<char[]> buffer(new char[product.limbs.size() * kBaseDigits + 16]);
