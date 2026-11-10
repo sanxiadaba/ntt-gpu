@@ -1,4 +1,9 @@
 input.txt
 output.txt
 optimized_output.txt
+bench_out*.txt
 *.exe
+*.lib
+*.exp
+tmpxft_*
+tests/__pycache__/
