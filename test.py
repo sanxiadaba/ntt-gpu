@@ -25,7 +25,7 @@ MAX_DIGITS = 1 << 29  # 4 * 2^27，单边位数上限
 
 
 def decode(data):
-    """程序按控制台代码页输出提示信息，两种编码都试一下。"""
+    """程序输出是 ASCII，这里做一次兜底解码。"""
     for encoding in ("utf-8", "gbk"):
         try:
             return data.decode(encoding)
@@ -198,13 +198,13 @@ def main():
         passes += ok
 
     errors = {
-        "三行": (b"1\n2\n3\n", "输入多于两行"),
-        "只有一行": (b"123\n", "恰好两行"),
-        "空文件": (b"", "恰好两行"),
-        "第二行为空": (b"123\n\n", "第二个输入为空"),
-        "含字母": (b"12a\n34\n", "非十进制字符"),
-        "含空格": (b"12 \n34\n", "非十进制字符"),
-        "中文": ("12中\n34\n".encode(), "非十进制字符"),
+        "三行": (b"1\n2\n3\n", "more than two lines"),
+        "只有一行": (b"123\n", "exactly two lines"),
+        "空文件": (b"", "exactly two lines"),
+        "第二行为空": (b"123\n\n", "second input is empty"),
+        "含字母": (b"12a\n34\n", "non-digit character"),
+        "含空格": (b"12 \n34\n", "non-digit character"),
+        "中文": ("12中\n34\n".encode(), "non-digit character"),
     }
     for name, (payload, message) in errors.items():
         total += 1

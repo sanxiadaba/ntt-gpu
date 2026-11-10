@@ -5,8 +5,13 @@
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$source = Join-Path $root 'ntt_gpu.cu'
 $target = Join-Path $root 'ntt_gpu.exe'
+$sources = @('ntt_gpu.cu', 'decimal.cu', 'ntt.cu') | ForEach-Object { Join-Path $root $_ }
+foreach ($source in $sources) {
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw "找不到源文件：$source"
+    }
+}
 
 # cl.exe 需要的路径都在 vcvars64.bat 里
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -36,7 +41,7 @@ if (-not $nvcc) {
 
 # -arch=native 按本机显卡生成代码，换显卡后重新编译一次即可。
 # 源码要带 UTF-8 BOM，否则 nvcc 按系统代码页读中文注释会报 missing closing quote。
-& $nvcc $source -O2 '-Xcompiler=/O2,/wd4819' -std=c++17 -arch=native -o $target
+& $nvcc @sources -O2 '-Xcompiler=/O2,/wd4819' -std=c++17 -arch=native -o $target
 if ($LASTEXITCODE -ne 0) {
     throw "nvcc 失败，退出码 $LASTEXITCODE"
 }
