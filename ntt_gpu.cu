@@ -740,16 +740,25 @@ std::vector<u32> parse_limbs(std::string_view value, const char* label) {
     const char* text = value.data();
     std::vector<u32> limbs((digits + kBaseDigits - 1) / kBaseDigits);
 
+    // 一次吃掉 8 个字节：先用 SWAR 校验（高位半字节必须全是 3，低位半字节必须
+    // <= 9），再用三步乘加把 8 个数字拼成数值。逐字节带分支的老写法在 6000 万位
+    // 输入上要多花两倍时间。
+    // 字节序依赖小端（x86-64），本程序的平台假设就是它。
     auto parse_group = [&](size_t group) {
         const char* at = text + digits - 8 * (group + 1);
-        u32 chunk = 0;
-        for (size_t offset = 0; offset < 8; ++offset) {
-            const u32 digit = static_cast<u32>(static_cast<unsigned char>(at[offset])) - '0';
-            if (digit > 9) {
-                return false;
-            }
-            chunk = chunk * 10u + digit;
+        u64 word;
+        std::memcpy(&word, at, sizeof(word));
+        const u64 high_nibbles = word & 0xF0F0F0F0F0F0F0F0ull;
+        const u64 low_nibbles = word & 0x0F0F0F0F0F0F0F0Full;
+        if (high_nibbles != 0x3030303030303030ull ||
+            ((low_nibbles + 0x0606060606060606ull) & 0xF0F0F0F0F0F0F0F0ull) != 0) {
+            return false;
         }
+        const u64 digits_u64 = word - 0x3030303030303030ull;  // 每字节一个数字
+        u64 pair = (digits_u64 * 10 + (digits_u64 >> 8)) & 0x00FF00FF00FF00FFull;
+        pair = (pair * 100 + (pair >> 16)) & 0x0000FFFF0000FFFFull;
+        const u32 chunk =
+            static_cast<u32>((pair * 10000 + (pair >> 32)) & 0xFFFFFFFFull);
         limbs[2 * group] = chunk % kBase;
         limbs[2 * group + 1] = chunk / kBase;
         return true;
